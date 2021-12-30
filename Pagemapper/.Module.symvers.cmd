@@ -1,0 +1,1 @@
+cmd_/root/Share/Project_4/Pagemapper/Module.symvers := sed 's/\.ko$$/\.o/' /root/Share/Project_4/Pagemapper/modules.order | scripts/mod/modpost     -o /root/Share/Project_4/Pagemapper/Module.symvers -e -i Module.symvers   -T -

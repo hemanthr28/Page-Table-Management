@@ -1,0 +1,191 @@
+diff --git a/include/asm-generic/pgalloc.h b/include/asm-generic/pgalloc.h
+index 02932efad3ab..946ab5703046 100644
+--- a/include/asm-generic/pgalloc.h
++++ b/include/asm-generic/pgalloc.h
+@@ -1,4 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
++#ifdef CONFIG_NUMA
++#include <linux/numa.h>
++#endif
++
+ #ifndef __ASM_GENERIC_PGALLOC_H
+ #define __ASM_GENERIC_PGALLOC_H
+ 
+@@ -59,9 +63,20 @@ static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
+ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
+ {
+ 	struct page *pte;
++#ifdef CONFIG_NUMA
++       /*If current node is invalid or page allocation fails try on other node*/
++       int i;
++       for(i = 0; i<nr_node_ids; i++){
++	pte = __alloc_pages_nodemask(gfp,0,i,NULL);
++	if (!pte) /*Page allocation succeeded*/
++		break;
++       }
++
++#else
++       pte = alloc_page(gfp);
++#endif
+ 
+-	pte = alloc_page(gfp);
+-	if (!pte)
++       if (!pte)
+ 		return NULL;
+ 	if (!pgtable_pte_page_ctor(pte)) {
+ 		__free_page(pte);
+@@ -123,7 +138,16 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
+ 
+ 	if (mm == &init_mm)
+ 		gfp = GFP_PGTABLE_KERNEL;
+-	page = alloc_pages(gfp, 0);
++	
++#ifdef CONFIG_NUMA
++       
++       int node_id = 0;
++        page = __alloc_pages_nodemask(gfp, 0, node_id, NULL);	
++#else
++
++       page = alloc_pages(gfp, 0);
++#endif
++
+ 	if (!page)
+ 		return NULL;
+ 	if (!pgtable_pmd_page_ctor(page)) {
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 62b81d5257aa..12b1315cf6ca 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1153,7 +1153,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 	 * and possibly modified by its owner - don't rely on the page
+ 	 * state.
+ 	 */
+-	if (rc == MIGRATEPAGE_SUCCESS) {
++	if (rc == MIGRATEPAGE_SUCCESS) {		
+ 		if (unlikely(!is_lru))
+ 			put_page(newpage);
+ 		else
+@@ -1163,10 +1163,62 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 	return rc;
+ }
+ 
++/*Function to migrate PTEs based on the physical page migration*/
++static void migrate_pte(struct page *newpage, unsigned long private){
++	
++	unsigned long addr, new_pg_addr, old_pg_addr;
++	
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	struct page *ptepg = NULL;
++	int newnid;
++	struct mm_struct *mm = current->mm;
++	struct page *newpte, *oldpte;
++	unsigned long flag;
++	addr = (unsigned long)page_address(newpage);
++
++	pgd = pgd_offset(mm, addr);
++	p4d = p4d_offset(pgd, addr);
++ 	pud = pud_offset(p4d, addr);
++ 	pmd = pmd_offset(pud, addr);
++	pte = pte_offset_map(pmd, addr);
++
++	ptepg = pmd_page(*pmd);
++	newnid = page_to_nid(ptepg);
++	printk(KERN_INFO "ORIGINAL PTE NODE ID %d\n", newnid);
++	if (newnid == private)
++		return;
++
++	else if (private == 1){
++		if(newnid == 0)
++		       return;
++	}	
++
++	spin_lock_irqsave(&mm->page_table_lock, flag);
++	newpte = alloc_pages_node(0, GFP_KERNEL, 0);
++
++	if(newpte)
++	{
++		new_pg_addr = page_address(newpte);
++		printk(KERN_INFO "NEW PTE NODE ID %d\n", page_to_nid(newpte));
++		flush_tlb_all();
++		oldpte = pmd_page(*pmd);
++		old_pg_addr = page_address(oldpte);
++		memcpy(new_pg_addr, old_pg_addr, 4096);
++		pmd = (pmd_t *)page_address(newpte);
++	}
++	spin_unlock_irqrestore(&mm->page_table_lock, flag);
++}
++
+ /*
+  * Obtain the lock on page, remove all ptes and migrate the page
+  * to the newly allocated page in newpage.
+  */
++
+ static int unmap_and_move(new_page_t get_new_page,
+ 				   free_page_t put_new_page,
+ 				   unsigned long private, struct page *page,
+@@ -1220,8 +1272,12 @@ static int unmap_and_move(new_page_t get_new_page,
+ 		/*
+ 		 * Compaction can migrate also non-LRU pages which are
+ 		 * not accounted to NR_ISOLATED_*. They can be recognized
+-		 * as __PageMovable
+-		 */
++		 * as __PageMovable	
++	       	*/
++		
++		/*If page migration is successful, migrate the corresponding pte*/
++		migrate_pte(newpage, private);
++
+ 		if (likely(!__PageMovable(page)))
+ 			mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON +
+ 					page_is_file_lru(page), -thp_nr_pages(page));
+@@ -1231,6 +1287,8 @@ static int unmap_and_move(new_page_t get_new_page,
+ 			 * We release the page in page_handle_poison.
+ 			 */
+ 			put_page(page);
++		
++
+ 	} else {
+ 		if (rc != -EAGAIN)
+ 			list_add_tail(&page->lru, ret);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index cfc72873961d..2a68950dc58a 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -79,13 +79,15 @@
+ #include "internal.h"
+ #include "shuffle.h"
+ #include "page_reporting.h"
++#include <linux/numa.h>
+ 
+ /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
+ typedef int __bitwise fpi_t;
+ 
+ /* No special request */
+ #define FPI_NONE		((__force fpi_t)0)
+-
++#define GFP_PGTABLE_KERNEL      (GFP_KERNEL | __GFP_ZERO)
++#define GFP_PGTABLE_USER        (GFP_PGTABLE_KERNEL | __GFP_ACCOUNT)
+ /*
+  * Skip free page reporting notification for the (possibly merged) page.
+  * This does not hinder free page reporting from grabbing the page,
+@@ -5041,7 +5043,14 @@ unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
+ {
+ 	struct page *page;
+ 
+-	page = alloc_pages(gfp_mask & ~__GFP_HIGHMEM, order);
++#ifdef CONFIG_NUMA
++
++	int node_id = 0;
++	page = alloc_pages_node(0, gfp_mask & ~__GFP_HIGHMEM, order);
++
++#else
++        page = alloc_pages(gfp_mask & ~__GFP_HIGHMEM, order);
++#endif
+ 	if (!page)
+ 		return 0;
+ 	return (unsigned long) page_address(page);
