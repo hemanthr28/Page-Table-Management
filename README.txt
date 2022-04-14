@@ -1,5 +1,5 @@
 ###############################################################################################################################
-ECE 5414G: Advanced Linux Kernel Programming
+Advanced Linux Kernel Programming
 Efficient Page Table Migration on Heterogeneous Memory Systems 
 ###############################################################################################################################
 
